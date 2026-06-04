@@ -19,37 +19,6 @@
 #include <utility>
 #include <vector>
 
-// Compile-time variant defaults.
-// You can override any runtime config using "config <clave> <valor>" commands.
-// Example:
-//   g++ -std=c++20 -O2 src/main.cpp -o rummy-cli -DRUMMY_VARIANT_GIN
-#if defined(RUMMY_VARIANT_GIN)
-static constexpr int DEFAULT_PLAYERS = 2;
-static constexpr int DEFAULT_DECKS = 1;
-static constexpr int DEFAULT_PRINTED_JOKERS = 0;
-static constexpr int DEFAULT_HAND_SIZE = 10;
-static constexpr bool DEFAULT_ENABLE_WILD = false;
-static constexpr bool DEFAULT_ALLOW_WRAP = false;
-static constexpr const char* DEFAULT_VARIANT_NAME = "gin";
-#elif defined(RUMMY_VARIANT_500)
-static constexpr int DEFAULT_PLAYERS = 4;
-static constexpr int DEFAULT_DECKS = 2;
-static constexpr int DEFAULT_PRINTED_JOKERS = 0;
-static constexpr int DEFAULT_HAND_SIZE = 13;
-static constexpr bool DEFAULT_ENABLE_WILD = false;
-static constexpr bool DEFAULT_ALLOW_WRAP = false;
-static constexpr const char* DEFAULT_VARIANT_NAME = "rummy500";
-#else
-// Default: Indian-like 13 card rummy profile.
-static constexpr int DEFAULT_PLAYERS = 4;
-static constexpr int DEFAULT_DECKS = 2;
-static constexpr int DEFAULT_PRINTED_JOKERS = 2;
-static constexpr int DEFAULT_HAND_SIZE = 13;
-static constexpr bool DEFAULT_ENABLE_WILD = true;
-static constexpr bool DEFAULT_ALLOW_WRAP = false;
-static constexpr const char* DEFAULT_VARIANT_NAME = "indian13";
-#endif
-
 enum class Suit { CLUBS = 0, DIAMONDS = 1, HEARTS = 2, SPADES = 3, NONE = 4 };
 
 static char suitToChar(Suit s) {
@@ -94,12 +63,13 @@ struct Config {
     unsigned int seed = 0;
     bool outputParseable = true;
     int outputTopN = 3;
+    bool drawEndsTurn = true;
+    bool requireOwnMeldBeforeLayoff = true;
+    int openingMinPoints = 30;
 };
 
 struct Candidate {
     std::string label;
-    bool takeDiscard = false;
-    std::optional<Card> forcedDiscard;
     double winRate = 0.0;
     double improveRate = 0.0;
     double avgDeadwood = 0.0;
@@ -110,16 +80,20 @@ struct GameState {
     Config cfg;
     std::vector<Card> myHand;
     std::vector<std::vector<Card>> tableMelds;
-    std::vector<Card> discardPile;
+    std::vector<bool> tableMeldIsMine;
     std::unordered_map<std::string, int> seen;
     std::vector<std::string> history;
+    bool hasOpenedOwnMeld = false;
+    bool turnClosedByDraw = false;
 
     void clear() {
         myHand.clear();
         tableMelds.clear();
-        discardPile.clear();
+        tableMeldIsMine.clear();
         seen.clear();
         history.clear();
+        hasOpenedOwnMeld = false;
+        turnClosedByDraw = false;
     }
 };
 
@@ -237,6 +211,12 @@ static int cardPoints(const Card& c, const Config& cfg) {
     return c.rank + 1;
 }
 
+static int meldPoints(const std::vector<Card>& meld, const Config& cfg) {
+    int sum = 0;
+    for (const Card& c : meld) sum += cardPoints(c, cfg);
+    return sum;
+}
+
 static bool removeOneByFace(std::vector<Card>& cards, const Card& target) {
     auto it = std::find_if(cards.begin(), cards.end(), [&](const Card& c) {
         return c.printedJoker == target.printedJoker && c.rank == target.rank && c.suit == target.suit;
@@ -321,6 +301,7 @@ static bool isSet(const std::vector<Card>& cards, const Config& cfg) {
     if (cards.size() < 3) return false;
     int jokers = 0;
     int rank = -1;
+    std::set<Suit> suits;
     for (const Card& c : cards) {
         if (isJokerLike(c, cfg)) {
             ++jokers;
@@ -328,8 +309,13 @@ static bool isSet(const std::vector<Card>& cards, const Config& cfg) {
         }
         if (rank == -1) rank = c.rank;
         else if (c.rank != rank) return false;
+
+        // In Rummikub sets, non-joker tiles must have distinct colors.
+        if (suits.count(c.suit)) return false;
+        suits.insert(c.suit);
     }
     if (jokers > cfg.maxJokersPerMeld) return false;
+    if (cards.size() > 4) return false;
     return rank != -1;
 }
 
@@ -501,14 +487,12 @@ static std::string cardsToString(const std::vector<Card>& cards, const Config& c
     return out.str();
 }
 
-static std::string buildRecommendedCommand(const GameState& st, const Candidate& c) {
-    if (c.takeDiscard && !st.discardPile.empty()) {
-        std::string discard = c.forcedDiscard.has_value() ? c.forcedDiscard->faceKey() : "<CARTA_A_DESCARTAR>";
-        return "tomo_descarte\\ndescarto " + discard;
+static std::string buildRecommendedCommand(const GameState& st, [[maybe_unused]] const Candidate& c) {
+    if (st.cfg.drawEndsTurn) {
+        return "recibo <FICHA_DEL_POZO>";
     }
 
-    // Al tomar del mazo, la carta real llega desde la UI/fuente externa.
-    return "recibo <CARTA_DEL_MAZO>\\nturno";
+    return "recibo <FICHA_DEL_POZO>\\nturno";
 }
 
 static std::string escapeForQuoted(const std::string& s) {
@@ -684,7 +668,8 @@ static std::string buildRearrangementPlanCommand(const RearrangementPlan& plan, 
     }
 
     for (const auto& move : plan.followUp.layoffMoves) {
-        commands.push_back("cuelo " + move.card.faceKey() + " en " + cardsToFaceList(move.targetMeldBefore));
+        const std::vector<Card> orderedTarget = orderedMeldForOutput(move.targetMeldBefore, cfg);
+        commands.push_back("cuelo " + move.card.faceKey() + " en " + cardsToFaceList(orderedTarget));
     }
 
     std::ostringstream out;
@@ -777,6 +762,14 @@ static ImmediatePlan buildImmediatePlan(const GameState& st) {
         if (!picked) break;
     }
 
+    if (!st.hasOpenedOwnMeld) {
+        int openingPoints = 0;
+        for (const auto& meld : plan.meldsToLayDown) openingPoints += meldPoints(meld, st.cfg);
+        if (openingPoints < st.cfg.openingMinPoints) {
+            return ImmediatePlan{};
+        }
+    }
+
     std::vector<Card> remainingHand;
     remainingHand.reserve(hand.size());
     for (int i = 0; i < n; ++i) {
@@ -784,13 +777,22 @@ static ImmediatePlan buildImmediatePlan(const GameState& st) {
     }
 
     std::vector<std::vector<Card>> table = st.tableMelds;
-    for (const auto& meld : plan.meldsToLayDown) table.push_back(meld);
+    std::vector<bool> tableIsMine = st.tableMeldIsMine;
+    while (tableIsMine.size() < table.size()) tableIsMine.push_back(false);
+    for (const auto& meld : plan.meldsToLayDown) {
+        table.push_back(meld);
+        tableIsMine.push_back(true);
+    }
+
+    const bool canLayoffOnForeign = !st.cfg.requireOwnMeldBeforeLayoff || st.hasOpenedOwnMeld
+                                 || !plan.meldsToLayDown.empty();
 
     bool progressed = true;
     while (progressed) {
         progressed = false;
         for (size_t i = 0; i < remainingHand.size(); ++i) {
             for (size_t m = 0; m < table.size(); ++m) {
+                if (!canLayoffOnForeign && (m >= tableIsMine.size() || !tableIsMine[m])) continue;
                 if (canLayoffCardToMeld(remainingHand[i], table[m], st.cfg)) {
                     LayoffSuggestion move;
                     move.card = remainingHand[i];
@@ -810,16 +812,30 @@ static ImmediatePlan buildImmediatePlan(const GameState& st) {
     return plan;
 }
 
-static std::string buildImmediatePlanCommand(const ImmediatePlan& plan, const Config& cfg) {
+static std::string buildImmediatePlanCommand(const ImmediatePlan& plan, const Config& cfg, bool useAtomicOpening) {
     std::vector<std::string> commands;
     commands.reserve(plan.meldsToLayDown.size() + plan.layoffMoves.size());
 
-    for (const auto& meld : plan.meldsToLayDown) {
-        const std::vector<Card> ordered = orderedMeldForOutput(meld, cfg);
-        commands.push_back("bajo " + cardsToFaceList(ordered));
+    if (useAtomicOpening && !plan.meldsToLayDown.empty()) {
+        std::ostringstream openCmd;
+        for (size_t i = 0; i < plan.meldsToLayDown.size(); ++i) {
+            const auto& meld = plan.meldsToLayDown[i];
+            const std::vector<Card> ordered = orderedMeldForOutput(meld, cfg);
+            if (i == 0) openCmd << "bajo ";
+            else openCmd << " bajo ";
+            openCmd << cardsToFaceList(ordered);
+        }
+        commands.push_back(openCmd.str());
+    } else {
+        for (const auto& meld : plan.meldsToLayDown) {
+            const std::vector<Card> ordered = orderedMeldForOutput(meld, cfg);
+            commands.push_back("bajo " + cardsToFaceList(ordered));
+        }
     }
+
     for (const auto& move : plan.layoffMoves) {
-        commands.push_back("cuelo " + move.card.faceKey() + " en " + cardsToFaceList(move.targetMeldBefore));
+        const std::vector<Card> orderedTarget = orderedMeldForOutput(move.targetMeldBefore, cfg);
+        commands.push_back("cuelo " + move.card.faceKey() + " en " + cardsToFaceList(orderedTarget));
     }
 
     std::ostringstream out;
@@ -838,30 +854,42 @@ static int deadwoodAfterLayoff(const std::vector<Card>& hand, const std::vector<
     return minDeadwood(h, cfg);
 }
 
-static SimOutcome simulateCandidate(const GameState& st, const Candidate& cand, std::mt19937& rng, int baselineDeadwood) {
+static SimOutcome simulateCandidate(const GameState& st, [[maybe_unused]] const Candidate& cand,
+                                    std::mt19937& rng, int baselineDeadwood) {
     std::vector<Card> pool = remainingUnknownPool(st);
     std::vector<Card> myHand = st.myHand;
     std::vector<std::vector<Card>> table = st.tableMelds;
 
-    if (cand.takeDiscard) {
-        if (st.discardPile.empty()) return {0.0, 0.0, 999.0};
-        myHand.push_back(st.discardPile.back());
-    } else {
-        if (pool.empty()) return {0.0, 0.0, 999.0};
-        myHand.push_back(drawRandom(pool, rng));
+    if (pool.empty()) return {0.0, 0.0, 999.0};
+    myHand.push_back(drawRandom(pool, rng));
+
+    if (st.cfg.drawEndsTurn) {
+        int myDw = deadwoodAfterLayoff(myHand, table, st.cfg);
+
+        int players = std::max(2, st.cfg.numPlayers);
+        std::vector<std::vector<Card>> oppHands(players - 1);
+        for (int i = 0; i < players - 1; ++i) {
+            for (int k = 0; k < st.cfg.baseHandSize && !pool.empty(); ++k) oppHands[i].push_back(drawRandom(pool, rng));
+        }
+
+        int better = 0;
+        int equal = 0;
+        for (auto& h : oppHands) {
+            int d = minDeadwood(h, st.cfg);
+            if (myDw < d) ++better;
+            if (myDw == d) ++equal;
+        }
+
+        double win = 0.0;
+        if (better == players - 1) win = 1.0;
+        else if (better + equal == players - 1) win = 0.5;
+
+        return {win, myDw < baselineDeadwood ? 1.0 : 0.0, static_cast<double>(myDw)};
     }
 
-    Card discard;
-    if (cand.forcedDiscard.has_value()) {
-        discard = *cand.forcedDiscard;
-    } else {
-        // Fast simulation path: use cheap discard heuristic to keep Monte Carlo responsive.
-        auto best = chooseFastDiscard(myHand, st.cfg);
-        if (!best.has_value()) return {0.0, 0.0, 999.0};
-        discard = *best;
-    }
-
-    if (!removeOneByFace(myHand, discard)) return {0.0, 0.0, 999.0};
+    auto best = chooseFastDiscard(myHand, st.cfg);
+    if (!best.has_value()) return {0.0, 0.0, 999.0};
+    if (!removeOneByFace(myHand, *best)) return {0.0, 0.0, 999.0};
 
     int players = std::max(2, st.cfg.numPlayers);
     std::vector<std::vector<Card>> oppHands(players - 1);
@@ -910,53 +938,33 @@ static SimOutcome simulateCandidate(const GameState& st, const Candidate& cand, 
     return {win, myDw < baselineDeadwood ? 1.0 : 0.0, static_cast<double>(myDw)};
 }
 
-static std::vector<Candidate> buildCandidates(const GameState& st) {
+static std::vector<Candidate> buildCandidates([[maybe_unused]] const GameState& st) {
     std::vector<Candidate> out;
 
-    // Option: take stock (unknown draw), then best discard policy in simulation.
     Candidate stock;
-    stock.label = "TOMAR_MAZO (carta oculta, descarte optimizado)";
-    stock.takeDiscard = false;
+    stock.label = "TOMAR_POZO (ficha oculta)";
     out.push_back(stock);
-
-    if (!st.discardPile.empty()) {
-        Card top = st.discardPile.back();
-        std::vector<Card> hand = st.myHand;
-        hand.push_back(top);
-
-        std::set<std::string> seenDiscardFaces;
-        for (const Card& d : hand) {
-            std::string k = d.faceKey();
-            if (seenDiscardFaces.count(k)) continue;
-            seenDiscardFaces.insert(k);
-
-            std::vector<Card> h2 = hand;
-            if (!removeOneByFace(h2, d)) continue;
-            std::vector<std::vector<Card>> t2 = st.tableMelds;
-            applyGreedyLayoff(h2, t2, st.cfg);
-
-            Candidate c;
-            c.takeDiscard = true;
-            c.forcedDiscard = d;
-            c.immediateDeadwood = minDeadwood(h2, st.cfg);
-            c.label = "TOMAR_DESCARTE " + top.faceKey() + " y DESCARTAR " + d.faceKey();
-            out.push_back(c);
-        }
-    }
 
     return out;
 }
 
 static void rankAndPrintRecommendations(const GameState& st) {
     if (st.myHand.empty()) {
-        std::cout << "No hay cartas en mano. Usa 'recibo <carta>' o 'mano <cartas...>'.\n";
+        std::cout << "No hay fichas en mano. Usa 'recibo <ficha>' o 'mano <fichas...>'.\n";
         return;
     }
 
     int baseline = deadwoodAfterLayoff(st.myHand, st.tableMelds, st.cfg);
-    auto candidates = buildCandidates(st);
     ImmediatePlan immediatePlan = buildImmediatePlan(st);
     RearrangementPlan rearrangementPlan = buildRearrangementPlan(st);
+    const bool hasImmediateActions = !immediatePlan.meldsToLayDown.empty()
+                                  || !immediatePlan.layoffMoves.empty()
+                                  || rearrangementPlan.hasPlan;
+
+    std::vector<Candidate> candidates;
+    if (!hasImmediateActions) {
+        candidates = buildCandidates(st);
+    }
 
     std::mt19937 rng;
     if (st.cfg.seed != 0) rng.seed(st.cfg.seed);
@@ -979,12 +987,10 @@ static void rankAndPrintRecommendations(const GameState& st) {
         c.improveRate = imp / sims;
         c.avgDeadwood = dead / sims;
 
-        if (!c.forcedDiscard.has_value()) {
-            std::vector<Card> h = st.myHand;
-            std::vector<std::vector<Card>> t = st.tableMelds;
-            applyGreedyLayoff(h, t, st.cfg);
-            c.immediateDeadwood = minDeadwood(h, st.cfg);
-        }
+        std::vector<Card> h = st.myHand;
+        std::vector<std::vector<Card>> t = st.tableMelds;
+        applyGreedyLayoff(h, t, st.cfg);
+        c.immediateDeadwood = minDeadwood(h, st.cfg);
     }
 
     std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
@@ -993,23 +999,24 @@ static void rankAndPrintRecommendations(const GameState& st) {
         return a.avgDeadwood < b.avgDeadwood;
     });
 
-    if (!candidates.empty()) {
-        const std::string cmd = buildRecommendedCommand(st, candidates.front());
-        std::cout << "RECOMMENDED_PLAY \"" << escapeForQuoted(cmd) << "\"\n";
-    }
-
-    if (!immediatePlan.meldsToLayDown.empty() || !immediatePlan.layoffMoves.empty()) {
-        const std::string immediateCmd = buildImmediatePlanCommand(immediatePlan, st.cfg);
-        std::cout << "IMMEDIATE_PLAY \"" << escapeForQuoted(immediateCmd) << "\"\n";
-    }
-
+    std::string recommendedCmd;
     if (rearrangementPlan.hasPlan) {
-        const std::string rearrangeCmd = buildRearrangementPlanCommand(rearrangementPlan, st.cfg);
-        std::cout << "REARRANGE_PLAY \"" << escapeForQuoted(rearrangeCmd) << "\"\n";
+        recommendedCmd = buildRearrangementPlanCommand(rearrangementPlan, st.cfg);
+    } else if (!immediatePlan.meldsToLayDown.empty() || !immediatePlan.layoffMoves.empty()) {
+        recommendedCmd = buildImmediatePlanCommand(immediatePlan, st.cfg, !st.hasOpenedOwnMeld);
+    } else if (!candidates.empty()) {
+        recommendedCmd = buildRecommendedCommand(st, candidates.front());
     }
 
-    int topN = std::max(1, st.cfg.outputTopN);
-    topN = std::min(topN, static_cast<int>(candidates.size()));
+    if (!recommendedCmd.empty()) {
+        std::cout << "RECOMMENDED_PLAY \"" << escapeForQuoted(recommendedCmd) << "\"\n";
+    }
+
+    int topN = 0;
+    if (!hasImmediateActions) {
+        topN = std::max(1, st.cfg.outputTopN);
+        topN = std::min(topN, static_cast<int>(candidates.size()));
+    }
 
     std::vector<Card> h = st.myHand;
     std::vector<std::vector<Card>> t = st.tableMelds;
@@ -1025,35 +1032,11 @@ static void rankAndPrintRecommendations(const GameState& st) {
         std::cout << " layoff_cards=" << laid;
         std::cout << " top_n=" << topN << "\n";
 
-        std::cout << "IMMEDIATE summary="
-              << (!immediatePlan.meldsToLayDown.empty() || !immediatePlan.layoffMoves.empty() ? "available" : "none")
-              << " melds=" << immediatePlan.meldsToLayDown.size()
-              << " layoffs=" << immediatePlan.layoffMoves.size() << "\n";
-
-        if (rearrangementPlan.hasPlan) {
-            std::cout << "REARRANGE summary=available";
-            std::cout << " source=M" << (rearrangementPlan.sourceMeldIndex + 1);
-            std::cout << " dest=M" << (rearrangementPlan.destMeldIndex + 1);
-            std::cout << " moved=" << rearrangementPlan.movedCard.faceKey();
-            std::cout << " followup_melds=" << rearrangementPlan.followUp.meldsToLayDown.size();
-            std::cout << " followup_layoffs=" << rearrangementPlan.followUp.layoffMoves.size();
-            std::cout << " deadwood_after=" << rearrangementPlan.resultingDeadwood << "\n";
-        } else {
-            std::cout << "REARRANGE summary=none\n";
-        }
-
         for (int i = 0; i < topN; ++i) {
             const Candidate& c = candidates[i];
             std::cout << "PLAY rank=" << (i + 1);
-            std::cout << " take=" << (c.takeDiscard ? "discard" : "stock");
-            if (c.takeDiscard && !st.discardPile.empty()) {
-                std::cout << " take_card=" << st.discardPile.back().faceKey();
-            }
-            if (c.forcedDiscard.has_value()) {
-                std::cout << " discard=" << c.forcedDiscard->faceKey();
-            } else {
-                std::cout << " discard=auto";
-            }
+            std::cout << " take=stock";
+            std::cout << " discard=none";
             std::cout << " win=" << std::fixed << std::setprecision(6) << c.winRate;
             std::cout << " improve=" << std::fixed << std::setprecision(6) << c.improveRate;
             std::cout << " deadwood_expected=" << std::fixed << std::setprecision(6) << c.avgDeadwood;
@@ -1064,7 +1047,7 @@ static void rankAndPrintRecommendations(const GameState& st) {
         std::cout << "END\n";
     } else {
         std::cout << "=== RECOMENDACIONES ===\n";
-        std::cout << "Variante=" << st.cfg.variantName
+        std::cout << "Modalidad=" << st.cfg.variantName
                   << " jugadores=" << st.cfg.numPlayers
                   << " mazos=" << st.cfg.numDecks
                   << " comodin_wild=" << (st.cfg.enableWildRank ? "si" : "no")
@@ -1082,14 +1065,19 @@ static void rankAndPrintRecommendations(const GameState& st) {
                 std::cout << "  - Bajo sugerido: bajo " << cardsToFaceList(ordered) << "\n";
             }
             for (const auto& move : immediatePlan.layoffMoves) {
+                const std::vector<Card> orderedTarget = orderedMeldForOutput(move.targetMeldBefore, st.cfg);
                 std::cout << "  - Colada sugerida: cuelo " << move.card.faceKey()
-                          << " en " << cardsToFaceList(move.targetMeldBefore) << "\n";
+                          << " en " << cardsToFaceList(orderedTarget) << "\n";
             }
         }
 
         if (rearrangementPlan.hasPlan) {
             std::cout << "Tenes un reacomodo posible para habilitar mas jugadas:\n";
             std::cout << "  - Reacomodo sugerido: " << buildRearrangementPlanCommand(rearrangementPlan, st.cfg) << "\n";
+        }
+
+        if (!recommendedCmd.empty()) {
+            std::cout << "Linea recomendada: " << recommendedCmd << "\n";
         }
 
         for (int i = 0; i < topN; ++i) {
@@ -1103,7 +1091,7 @@ static void rankAndPrintRecommendations(const GameState& st) {
 
         if (laid > 0) {
             std::cout << "Sugerencia de colada inmediata: podrias colar " << laid
-                      << " carta(s) en juegos de mesa antes/despues del descarte segun reglas de tu mesa.\n";
+                      << " ficha(s) en juegos de mesa segun reglas de tu mesa.\n";
         }
     }
 }
@@ -1111,14 +1099,12 @@ static void rankAndPrintRecommendations(const GameState& st) {
 static void printState(const GameState& st) {
     std::cout << "Estado actual:\n";
     std::cout << "  Mano (" << st.myHand.size() << "): " << cardsToString(st.myHand, st.cfg) << "\n";
-    std::cout << "  Descarte tope: ";
-    if (st.discardPile.empty()) std::cout << "(vacio)\n";
-    else std::cout << st.discardPile.back().toString() << "\n";
 
     std::cout << "  Juegos en mesa: " << st.tableMelds.size() << "\n";
     for (size_t i = 0; i < st.tableMelds.size(); ++i) {
         std::cout << "    M" << (i + 1) << ": " << cardsToString(st.tableMelds[i], st.cfg) << "\n";
     }
+    std::cout << "  Abri juego propio: " << (st.hasOpenedOwnMeld ? "si" : "no") << "\n";
 
     std::cout << "  Vistas en historial: " << st.seen.size() << " caras distintas\n";
 }
@@ -1152,30 +1138,9 @@ static void unmarkSeen(GameState& st, const Card& c) {
     else --(it->second);
 }
 
-static void applyGamePreset(GameState& st, const std::string& value) {
-    if (value == "rummikub") {
-        st.cfg.variantName = "rummikub";
-        st.cfg.numDecks = 2;
-        // 2 mazos con 2 jokers totales => 1 joker impreso por mazo.
-        st.cfg.printedJokersPerDeck = 1;
-        st.cfg.enableWildRank = false;
-        st.cfg.allowAKWrap = false;
-        st.cfg.baseHandSize = 14;
-        g_deadwoodMemo.clear();
-        return;
-    }
-
-    if (value == "indian13") {
-        st.cfg.variantName = "indian13";
-        st.cfg.numPlayers = 4;
-        st.cfg.numDecks = 2;
-        st.cfg.printedJokersPerDeck = 2;
-        st.cfg.enableWildRank = true;
-        st.cfg.wildRank = 0;
-        st.cfg.allowAKWrap = false;
-        st.cfg.baseHandSize = 13;
-        g_deadwoodMemo.clear();
-    }
+static void addTableMeld(GameState& st, const std::vector<Card>& meld, bool isMine) {
+    st.tableMelds.push_back(meld);
+    st.tableMeldIsMine.push_back(isMine);
 }
 
 static bool handleConfig(GameState& st, const std::vector<std::string>& tk) {
@@ -1305,16 +1270,6 @@ static bool handleConfig(GameState& st, const std::vector<std::string>& tk) {
         else return false;
         return true;
     }
-    if (key == "variante") {
-        applyGamePreset(st, value);
-        st.cfg.variantName = value;
-        return true;
-    }
-    if (key == "game" || key == "juego") {
-        applyGamePreset(st, value);
-        return true;
-    }
-
     return false;
 }
 
@@ -1322,29 +1277,26 @@ static void printHelp() {
     std::cout
         << "Comandos principales:\n"
         << "  config <clave> <valor>\n"
-        << "  mano <c1> <c2> ...                      # setea mano completa\n"
-        << "  recibo <carta>                          # agrega carta a mano\n"
-        << "  tomo_descarte                           # toma el tope del descarte\n"
-        << "  descarto <carta>                        # descarta desde mano\n"
-        << "  bajo <c1> <c2> <c3> [...]              # baja juego desde mano\n"
+        << "  mano <f1> <f2> ...                      # setea mano completa\n"
+        << "  recibo <ficha>                          # agrega ficha a mano\n"
+        << "  bajo <j1...> [bajo <j2...> ...]         # baja juego(s) desde mano; apertura atomica\n"
         << "  mesa <c1> <c2> <c3> [...]              # agrega juego visible en mesa\n"
         << "  otro_baja <jugadorN> <c1> <c2> <c3>... # otro jugador baja juego\n"
-        << "  cuelo <carta> en <cartas_del_juego>     # intenta colar en juego existente\n"
-        << "  otro_cuela <jugadorN> <carta> en <...>   # otro jugador agrega carta a juego\n"
-        << "  descarte <carta>                        # informa tope del descarte visible\n"
-        << "  sale <carta>                            # marca carta como vista en historial\n"
+        << "  cuelo <ficha> en <fichas_del_juego>     # intenta colar en juego existente\n"
+        << "  otro_cuela <jugadorN> <ficha> en <...>   # otro jugador agrega ficha a juego\n"
+        << "  sale <ficha>                            # marca ficha como vista en historial\n"
         << "  estado                                  # imprime estado\n"
-        << "  turno                                   # calcula ranking de jugadas\n"
+        << "  turno                                   # calcula recomendacion para tu turno actual\n"
         << "  reset                                   # borra estado\n"
         << "  help                                    # ayuda\n"
         << "  fin                                     # salir\n"
         << "\n"
         << "Claves de config:\n"
         << "  jugadores, mazos, jokers_impresos, joker_formato, wild_rank, wraps,\n"
-        << "  jokers_por_juego, simulaciones, output, top, horizonte, mano_inicial, seed, variante, juego\n"
-        << "  presets: config juego rummikub (2 mazos, 2 jokers totales)\n"
+        << "  jokers_por_juego, simulaciones, output, top, horizonte, mano_inicial, seed\n"
+        << "  modalidad fija: rummikub online con fichas\n"
         << "\n"
-        << "Formato de ficha/carta:\n"
+        << "Formato de ficha:\n"
         << "  Numero+color: 1N..13N, 1R..13R, 1M..13M, 1C..13C (N=negro, R=rojo, M=naranja, C=celeste)\n"
         << "  Alias admitidos: T/J/Q/K + color (ej: TC, JR)\n"
         << "  Joker: JO\n";
@@ -1379,12 +1331,14 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
         return true;
     }
 
-    if (cmd == "estado") {
+    if (cmd == "estado" || cmd == "estad") {
         printState(st);
         return true;
     }
 
     if (cmd == "turno" || cmd == "recomendar") {
+        // Interpreta 'turno' como inicio de un nuevo turno propio cuando consultas recomendaciones.
+        st.turnClosedByDraw = false;
         rankAndPrintRecommendations(st);
         return true;
     }
@@ -1415,7 +1369,7 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
         for (size_t i = 1; i < tk.size(); ++i) {
             auto c = parseCard(tk[i]);
             if (!c.has_value()) {
-                std::cout << "ERROR carta invalida: " << tk[i] << "\n";
+                std::cout << "ERROR ficha invalida: " << tk[i] << "\n";
                 std::cout << "ERROR mano rechazada: corrige e ingresa nuevamente\n";
                 return true;
             }
@@ -1439,18 +1393,22 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
         for (const Card& c : st.myHand) {
             markSeen(st, c);
         }
-        std::cout << "OK mano " << st.myHand.size() << " cartas\n";
+        std::cout << "OK mano " << st.myHand.size() << " fichas\n";
         return true;
     }
 
     if (cmd == "recibo") {
+        if (st.cfg.drawEndsTurn && st.turnClosedByDraw) {
+            std::cout << "ERROR tu turno anterior termino al robar del pozo; usa turno cuando vuelva a tocarte\n";
+            return true;
+        }
         if (tk.size() < 2) {
-            std::cout << "ERROR falta carta\n";
+            std::cout << "ERROR falta ficha\n";
             return true;
         }
         auto c = parseCard(tk[1]);
         if (!c.has_value()) {
-            std::cout << "ERROR carta invalida\n";
+            std::cout << "ERROR ficha invalida\n";
             return true;
         }
         if (!tryMarkSeen(st, *c)) {
@@ -1459,70 +1417,19 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
             return true;
         }
         st.myHand.push_back(*c);
+        if (st.cfg.drawEndsTurn) st.turnClosedByDraw = true;
         std::cout << "OK recibo " << c->toString() << "\n";
-        return true;
-    }
-
-    if (cmd == "tomo_descarte" || cmd == "toma_descarte" || cmd == "robo_descarte") {
-        if (st.discardPile.empty()) {
-            std::cout << "ERROR descarte vacio\n";
-            return true;
-        }
-
-        Card top = st.discardPile.back();
-        st.discardPile.pop_back();
-        st.myHand.push_back(top);
-        std::cout << "OK tomo_descarte " << top.toString() << "\n";
-        return true;
-    }
-
-    if (cmd == "descarto") {
-        if (tk.size() < 2) {
-            std::cout << "ERROR falta carta\n";
-            return true;
-        }
-        auto c = parseCard(tk[1]);
-        if (!c.has_value()) {
-            std::cout << "ERROR carta invalida\n";
-            return true;
-        }
-        if (!removeOneByFace(st.myHand, *c)) {
-            std::cout << "ERROR no estaba en mano\n";
-            return true;
-        }
-        st.discardPile.push_back(*c);
-        std::cout << "OK descarto " << c->toString() << "\n";
-        return true;
-    }
-
-    if (cmd == "descarte") {
-        if (tk.size() < 2) {
-            std::cout << "ERROR falta carta\n";
-            return true;
-        }
-        auto c = parseCard(tk[1]);
-        if (!c.has_value()) {
-            std::cout << "ERROR carta invalida\n";
-            return true;
-        }
-        if (!tryMarkSeen(st, *c)) {
-            std::cout << "ERROR excede copias disponibles: " << c->faceKey()
-                      << " (max=" << maxCopiesForCard(st.cfg, *c) << ")\n";
-            return true;
-        }
-        st.discardPile.push_back(*c);
-        std::cout << "OK tope descarte " << c->toString() << "\n";
         return true;
     }
 
     if (cmd == "sale") {
         if (tk.size() < 2) {
-            std::cout << "ERROR falta carta\n";
+            std::cout << "ERROR falta ficha\n";
             return true;
         }
         auto c = parseCard(tk[1]);
         if (!c.has_value()) {
-            std::cout << "ERROR carta invalida\n";
+            std::cout << "ERROR ficha invalida\n";
             return true;
         }
         if (!tryMarkSeen(st, *c)) {
@@ -1531,12 +1438,13 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
             return true;
         }
         std::cout << "OK vista " << c->toString() << "\n";
+        st.turnClosedByDraw = false;
         return true;
     }
 
     if (cmd == "bajo" || cmd == "mesa" || cmd == "otro_baja") {
         if (tk.size() < 4) {
-            std::cout << "ERROR un juego necesita al menos 3 cartas\n";
+            std::cout << "ERROR un juego necesita al menos 3 fichas\n";
             return true;
         }
 
@@ -1549,42 +1457,90 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
             startPos = 2;
         }
 
+        if (cmd == "bajo") {
+            if (st.cfg.drawEndsTurn && st.turnClosedByDraw) {
+                std::cout << "ERROR tu turno termino al robar del pozo\n";
+                return true;
+            }
+
+            std::vector<std::vector<Card>> ownMelds;
+            size_t pos = 1;
+            while (pos < tk.size()) {
+                if (lowerCopy(tk[pos]) == "bajo") ++pos;
+
+                std::vector<Card> meld;
+                while (pos < tk.size() && lowerCopy(tk[pos]) != "bajo") {
+                    auto c = parseCard(tk[pos]);
+                    if (!c.has_value()) {
+                        std::cout << "ERROR ficha invalida: " << tk[pos] << "\n";
+                        return true;
+                    }
+                    meld.push_back(*c);
+                    ++pos;
+                }
+
+                if (meld.size() < 3) {
+                    std::cout << "ERROR un juego necesita al menos 3 fichas\n";
+                    return true;
+                }
+                if (!isValidMeld(meld, st.cfg)) {
+                    std::cout << "ERROR juego no valido con reglas actuales\n";
+                    return true;
+                }
+                ownMelds.push_back(meld);
+            }
+
+            if (ownMelds.empty()) {
+                std::cout << "ERROR un juego necesita al menos 3 fichas\n";
+                return true;
+            }
+
+            if (!st.hasOpenedOwnMeld) {
+                int openingPoints = 0;
+                for (const auto& meld : ownMelds) openingPoints += meldPoints(meld, st.cfg);
+                if (openingPoints < st.cfg.openingMinPoints) {
+                    std::cout << "ERROR apertura invalida: la primera bajada propia debe sumar al menos "
+                              << st.cfg.openingMinPoints << " puntos\n";
+                    return true;
+                }
+            }
+
+            std::vector<Card> nextHand = st.myHand;
+            for (const auto& meld : ownMelds) {
+                for (const Card& c : meld) {
+                    if (!removeOneByFace(nextHand, c)) {
+                        std::cout << "ERROR esa ficha no esta en mano: " << c.faceKey() << "\n";
+                        return true;
+                    }
+                }
+            }
+
+            st.myHand = std::move(nextHand);
+            for (const auto& meld : ownMelds) {
+                for (const Card& c : meld) {
+                    unmarkSeen(st, c);
+                }
+                addTableMeld(st, meld, true);
+            }
+            st.hasOpenedOwnMeld = true;
+            st.turnClosedByDraw = false;
+            if (ownMelds.size() == 1) std::cout << "OK juego agregado\n";
+            else std::cout << "OK juegos agregados " << ownMelds.size() << "\n";
+            return true;
+        }
+
         std::vector<Card> meld;
         bool fail = false;
         for (size_t i = startPos; i < tk.size(); ++i) {
             auto c = parseCard(tk[i]);
             if (!c.has_value()) {
-                std::cout << "ERROR carta invalida: " << tk[i] << "\n";
+                std::cout << "ERROR ficha invalida: " << tk[i] << "\n";
                 fail = true;
                 break;
             }
             meld.push_back(*c);
         }
         if (fail) return true;
-
-        if (cmd == "bajo") {
-            if (!isValidMeld(meld, st.cfg)) {
-                std::cout << "ERROR juego no valido con reglas actuales\n";
-                return true;
-            }
-
-            std::vector<Card> nextHand = st.myHand;
-            for (const Card& c : meld) {
-                if (!removeOneByFace(nextHand, c)) {
-                    std::cout << "ERROR esa carta no esta en mano: " << c.faceKey() << "\n";
-                    return true;
-                }
-            }
-
-            st.myHand = std::move(nextHand);
-            for (const Card& c : meld) {
-                unmarkSeen(st, c);
-            }
-
-            st.tableMelds.push_back(meld);
-            std::cout << "OK juego agregado\n";
-            return true;
-        }
 
         if (cmd != "bajo") {
             std::unordered_map<std::string, int> addCounts;
@@ -1599,26 +1555,31 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
             }
         }
 
-        st.tableMelds.push_back(meld);
+        addTableMeld(st, meld, false);
         for (const Card& c : meld) {
             markSeen(st, c);
         }
         std::cout << "OK juego agregado\n";
+        st.turnClosedByDraw = false;
         return true;
     }
 
     if (cmd == "cuelo" || cmd == "otro_cuela") {
         // Format: cuelo <card> en <cards_del_juego>
         if (tk.size() < 4) {
-            std::cout << "ERROR formato: cuelo <carta> en <cartas_del_juego>\n";
+            std::cout << "ERROR formato: cuelo <ficha> en <fichas_del_juego>\n";
             return true;
         }
 
         bool isOther = (cmd == "otro_cuela");
+        if (!isOther && st.cfg.drawEndsTurn && st.turnClosedByDraw) {
+            std::cout << "ERROR tu turno termino al robar del pozo\n";
+            return true;
+        }
         size_t firstToken = 1;
         if (isOther) {
             if (tk.size() < 5) {
-                std::cout << "ERROR formato: otro_cuela <jugadorN> <carta> en <cartas_del_juego>\n";
+                std::cout << "ERROR formato: otro_cuela <jugadorN> <ficha> en <fichas_del_juego>\n";
                 return true;
             }
             firstToken = 2;
@@ -1641,13 +1602,13 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
             ++cardPos;
         }
         if (cardPos >= enPos) {
-            std::cout << "ERROR falta carta a colar\n";
+            std::cout << "ERROR falta ficha a colar\n";
             return true;
         }
 
         auto c = parseCard(tk[cardPos]);
         if (!c.has_value()) {
-            std::cout << "ERROR carta invalida\n";
+            std::cout << "ERROR ficha invalida\n";
             return true;
         }
 
@@ -1671,22 +1632,37 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
         std::vector<Card> nextHand = st.myHand;
         if (!isOther) {
             if (!removeOneByFace(nextHand, *c)) {
-                std::cout << "ERROR esa carta no esta en mano\n";
+                std::cout << "ERROR esa ficha no esta en mano\n";
                 return true;
             }
         }
 
         bool placed = false;
-        for (auto& meld : st.tableMelds) {
+        bool targetFound = false;
+        for (size_t idx = 0; idx < st.tableMelds.size(); ++idx) {
+            auto& meld = st.tableMelds[idx];
             if (meld.size() != target.size()) continue;
             std::multiset<std::string> a, b;
             for (const Card& x : meld) a.insert(x.faceKey());
             for (const Card& x : target) b.insert(x.faceKey());
+            if (a == b) {
+                targetFound = true;
+                if (st.cfg.requireOwnMeldBeforeLayoff && !st.hasOpenedOwnMeld
+                    && (idx >= st.tableMeldIsMine.size() || !st.tableMeldIsMine[idx])) {
+                    std::cout << "ERROR no podes colar en juegos ajenos antes de bajar uno propio\n";
+                    return true;
+                }
+            }
             if (a == b && canLayoffCardToMeld(*c, meld, st.cfg)) {
                 meld.push_back(*c);
                 placed = true;
                 break;
             }
+        }
+
+        if (!targetFound) {
+            std::cout << "ERROR juego objetivo no encontrado en mesa\n";
+            return true;
         }
 
         if (!placed) {
@@ -1699,32 +1675,37 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
         }
 
         if (isOther) markSeen(st, *c);
+        if (isOther) st.turnClosedByDraw = false;
 
-        std::cout << "OK carta colada\n";
+        std::cout << "OK ficha colada\n";
         return true;
     }
 
     if (cmd == "muevo" || cmd == "reacomodo") {
+        if (st.cfg.drawEndsTurn && st.turnClosedByDraw) {
+            std::cout << "ERROR tu turno termino al robar del pozo\n";
+            return true;
+        }
         if (tk.size() < 6) {
-            std::cout << "ERROR formato: muevo <carta> de Mx a My\n";
+            std::cout << "ERROR formato: muevo <ficha> de Mx a My\n";
             return true;
         }
 
         auto card = parseCard(tk[1]);
         if (!card.has_value()) {
-            std::cout << "ERROR carta invalida\n";
+            std::cout << "ERROR ficha invalida\n";
             return true;
         }
 
         if (lowerCopy(tk[2]) != "de" || lowerCopy(tk[4]) != "a") {
-            std::cout << "ERROR formato: muevo <carta> de Mx a My\n";
+            std::cout << "ERROR formato: muevo <ficha> de Mx a My\n";
             return true;
         }
 
         auto sourceIdx = parseMeldIndexToken(tk[3]);
         auto destIdx = parseMeldIndexToken(tk[5]);
         if (!sourceIdx.has_value() || !destIdx.has_value()) {
-            std::cout << "ERROR formato: muevo <carta> de Mx a My\n";
+            std::cout << "ERROR formato: muevo <ficha> de Mx a My\n";
             return true;
         }
         if (*sourceIdx >= st.tableMelds.size() || *destIdx >= st.tableMelds.size() || *sourceIdx == *destIdx) {
@@ -1735,13 +1716,13 @@ static bool processCommandLine(GameState& st, const std::string& line, bool& sho
         std::vector<Card> sourceOut;
         std::vector<Card> destOut;
         if (!moveCardBetweenMelds(st.tableMelds[*sourceIdx], st.tableMelds[*destIdx], *card, st.cfg, sourceOut, destOut)) {
-            std::cout << "ERROR no se pudo mover la carta\n";
+            std::cout << "ERROR no se pudo mover la ficha\n";
             return true;
         }
 
         st.tableMelds[*sourceIdx] = std::move(sourceOut);
         st.tableMelds[*destIdx] = std::move(destOut);
-        std::cout << "OK carta movida\n";
+        std::cout << "OK ficha movida\n";
         return true;
     }
 
